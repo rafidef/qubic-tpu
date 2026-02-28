@@ -174,7 +174,7 @@ class AdditionMiner:
     Implements the complete Qubic addition PoW algorithm.
     """
 
-    def __init__(self):
+    def __init__(self, use_jax: bool = None):
         self.current_ann = ANN()
         self.best_ann = ANN()
         self.init_value = InitValue()
@@ -183,11 +183,30 @@ class AdditionMiner:
         self.output_neuron_expected_value = [0] * NUMBER_OF_OUTPUT_NEURONS
         self.training_set = []
         self.pool = None
+        # Auto-detect JAX if not specified
+        self.use_jax = HAS_JAX if use_jax is None else use_jax
+        # Pre-computed numpy arrays for training data (built once)
+        self._training_inputs = None
+        self._training_outputs = None
 
     def initialize(self, mining_seed: bytes, pool: bytes):
         """Initialize with mining seed and pre-computed pool."""
         self.pool = pool
         self.training_set = generate_training_set()
+        # Pre-compute training data as numpy arrays for JAX path
+        if self.use_jax:
+            self._precompute_training_arrays()
+
+    def _precompute_training_arrays(self):
+        """Pre-compute training input/output arrays (done once, reused every inference)."""
+        inputs = np.zeros((TRAINING_SET_SIZE, NUMBER_OF_INPUT_NEURONS), dtype=np.int8)
+        outputs = np.zeros((TRAINING_SET_SIZE, NUMBER_OF_OUTPUT_NEURONS), dtype=np.int8)
+        for t_idx in range(TRAINING_SET_SIZE):
+            data_in, data_out = self.training_set[t_idx]
+            inputs[t_idx] = data_in
+            outputs[t_idx] = data_out
+        self._training_inputs = inputs
+        self._training_outputs = outputs
 
     # ----------------------------------------------------------
     # Neighbor counting (ring topology)
@@ -567,11 +586,70 @@ class AdditionMiner:
 
     def infer_ann(self) -> int:
         """Run inference on all training pairs and return total score."""
+        # Use JAX batch path when available (TPU/GPU)
+        if self.use_jax:
+            return self._batch_infer_ann_jax()
+        # Fallback: sequential Python path
         score = 0
         for i in range(TRAINING_SET_SIZE):
             self.run_tick_simulation(i)
             score += self.compute_matching_output()
         return score
+
+    def _batch_infer_ann_jax(self) -> int:
+        """JAX-accelerated inference over all 16,384 training pairs."""
+        pop = self.current_ann.population
+        neurons = self.current_ann.neurons
+
+        # Build weight matrix from current ANN topology
+        W_np = np.zeros((pop, pop), dtype=np.float32)
+        start_idx = self.get_synapse_start_index()
+        end_idx = self.get_synapse_end_index()
+        for n in range(pop):
+            for m in range(start_idx, end_idx):
+                weight = self.get_synapse_weight(n, m)
+                if weight != 0:
+                    offset = self.buffer_index_to_offset(m)
+                    nn_idx = self.clamp_neuron_index(n, offset)
+                    W_np[nn_idx, n] += weight
+        W = jnp.array(W_np)
+
+        # Build neuron type and index arrays
+        neuron_types_list = [neurons[i].type for i in range(pop)]
+        is_input = np.array([1 if t == NEURON_INPUT else 0 for t in neuron_types_list], dtype=np.float32)
+        is_input_j = jnp.array(is_input)
+
+        output_indices = [i for i in range(pop) if neurons[i].type == NEURON_OUTPUT]
+        output_indices_arr = jnp.array(output_indices)
+
+        # Build batch input values: [16384, pop]
+        batch_values_np = np.zeros((TRAINING_SET_SIZE, pop), dtype=np.float32)
+        input_neuron_indices = [i for i in range(pop) if neurons[i].type == NEURON_INPUT]
+        for col_idx, neuron_idx in enumerate(input_neuron_indices):
+            batch_values_np[:, neuron_idx] = self._training_inputs[:, col_idx].astype(np.float32)
+
+        expected_outputs = jnp.array(self._training_outputs)
+        values = jnp.array(batch_values_np)
+
+        # Run ticks (batched matmul on TPU)
+        for tick in range(NUMBER_OF_TICKS):
+            # new_values = clamp(W @ values^T)^T, keep input neurons
+            new_vals = jnp.matmul(values, W.T)  # [batch, pop]
+            new_vals = jnp.clip(new_vals, -1.0, 1.0)
+            # Preserve input neurons
+            new_vals = jnp.where(is_input_j, values, new_vals)
+
+            # Early exit: all outputs non-zero or no change
+            outputs = new_vals[:, output_indices_arr]
+            if bool(jnp.all(outputs != 0)) or bool(jnp.array_equal(new_vals, values)):
+                values = new_vals
+                break
+            values = new_vals
+
+        # Count matching outputs
+        final_outputs = values[:, output_indices_arr]
+        matches = jnp.sum(final_outputs == expected_outputs)
+        return int(matches)
 
     # ----------------------------------------------------------
     # ANN initialization
