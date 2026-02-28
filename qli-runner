@@ -1,0 +1,5 @@
+#!/bin/bash
+# qli-runner wrapper — makes tpu_miner.py executable as a qli-Client custom runner
+# Place this script next to tpu_miner.py and qli-Client, then chmod +x qli-runner
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec python3 "$DIR/tpu_miner.py" "$@"

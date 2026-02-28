@@ -14,3 +14,6 @@ build/
 venv/
 ENV/
 *.log
+*.spec
+dist/
+build/
